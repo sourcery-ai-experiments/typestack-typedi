@@ -1,4 +1,3 @@
-import { Container } from './container.class';
 import { ServiceNotFoundError } from './error/service-not-found.error';
 import { CannotInstantiateValueError } from './error/cannot-instantiate-value.error';
 import { Token } from './token.class';
@@ -8,20 +7,40 @@ import { ServiceIdentifier } from './types/service-identifier.type';
 import { ServiceMetadata } from './interfaces/service-metadata.interface';
 import { ServiceOptions } from './interfaces/service-options.interface';
 import { EMPTY_VALUE } from './empty.const';
+import { ContainerIdentifer } from './types/container-identifier.type';
+import { Handler } from './interfaces/handler.interface';
+import { ContainerRegistry } from './container-registry.class';
+import { AsyncInitializationRequiredError } from './error/async-initialization-required.error';
+import { isPromise } from './utils/is-promise.util';
 
 /**
  * TypeDI can have multiple containers.
  * One container is ContainerInstance.
  */
 export class ContainerInstance {
-  /** Container instance id. */
-  public readonly id!: string;
+  /** Container instance ID. */
+  public readonly id!: ContainerIdentifer;
 
   /** All registered services in the container. */
   private services: ServiceMetadata<unknown>[] = [];
 
-  constructor(id: string) {
+  /**
+   * All registered handlers. The @Inject() decorator uses handlers internally to mark a property for injection.
+   **/
+  private readonly handlers: Handler[] = [];
+
+  private disposed: boolean = false;
+
+  constructor(id: ContainerIdentifer) {
     this.id = id;
+
+    ContainerRegistry.registerContainer(this);
+
+    /**
+     * TODO: This is to replicate the old functionality. This should be copied only
+     * TODO: if the container decides to inherit registered classes from a parent container.
+     */
+    this.handlers = ContainerRegistry.defaultContainer?.handlers || [];
   }
 
   /**
@@ -45,7 +64,7 @@ export class ContainerInstance {
   get<T>(id: Token<T>): T;
   get<T>(id: ServiceIdentifier<T>): T;
   get<T>(identifier: ServiceIdentifier<T>): T {
-    const globalContainer = Container.of(undefined);
+    const globalContainer = ContainerRegistry.defaultContainer;
     const globalService = globalContainer.findService(identifier);
     const scopedService = this.findService(identifier);
 
@@ -119,6 +138,8 @@ export class ContainerInstance {
         multiple: false,
         eager: false,
         transient: false,
+        async: false,
+        asyncInitializationStatus: 'pending',
       });
     }
 
@@ -133,6 +154,8 @@ export class ContainerInstance {
         multiple: false,
         eager: false,
         transient: false,
+        async: false,
+        asyncInitializationStatus: 'pending',
       });
     }
 
@@ -145,7 +168,9 @@ export class ContainerInstance {
       multiple: false,
       eager: false,
       transient: false,
-      ...identifierOrServiceMetadata,
+      async: false,
+      asyncInitializationStatus: 'pending',
+      asyncInitializationPromise: undefined,
     };
 
     const service = this.findService(newService.id);
@@ -156,7 +181,8 @@ export class ContainerInstance {
       this.services.push(newService);
     }
 
-    if (newService.eager) {
+    /** Async services are always eager, because we need to create an instance to call the setup function. */
+    if (newService.eager || newService.async) {
       this.get(newService.id);
     }
 
@@ -184,6 +210,45 @@ export class ContainerInstance {
   }
 
   /**
+   * Gets a separate container instance for the given instance id.
+   */
+  public of(containerId: ContainerIdentifer = 'default'): ContainerInstance {
+    if (containerId === 'default') {
+      return ContainerRegistry.defaultContainer;
+    }
+
+    let container: ContainerInstance;
+
+    if (ContainerRegistry.hasContainer(containerId)) {
+      container = ContainerRegistry.getContainer(containerId);
+    } else {
+      /**
+       * This is deprecated functionality, for now we create the container if it's doesn't exists.
+       * This will be reworked when container inheritance is reworked.
+       */
+      container = new ContainerInstance(containerId);
+    }
+
+    return container;
+  }
+
+  /**
+   * Registers a new handler.
+   */
+  public registerHandler(handler: Handler): ContainerInstance {
+    this.handlers.push(handler);
+    return this;
+  }
+
+  /**
+   * Helper method that imports given services.
+   */
+  /* eslint-disable-next-line @typescript-eslint/no-unused-vars */
+  public import(services: Function[]): ContainerInstance {
+    return this;
+  }
+
+  /**
    * Completely resets the container by removing all previously registered services from it.
    */
   public reset(options: { strategy: 'resetValue' | 'resetServices' } = { strategy: 'resetValue' }): this {
@@ -199,6 +264,60 @@ export class ContainerInstance {
         throw new Error('Received invalid reset strategy.');
     }
     return this;
+  }
+
+  /**
+   * Awaits the initialization of async services.
+   *
+   * @returns Promise which resolves to empty array or an array of rejects with array of failed initialization tasks.
+   */
+  public async waitForServiceInitialization(): Promise<unknown> {
+    /**
+     * We need to await services which are:
+     *   - marked as async
+     *   - their init status is pending
+     *   - have a initialization promise
+     */
+    const initTasks = this.services.filter(service => service.async && service.asyncInitializationStatus === 'pending');
+
+    const initResult = await Promise.allSettled(
+      initTasks.map(service => {
+        if (isPromise(service.asyncInitializationStatus)) {
+          return service.asyncInitializationStatus;
+        } else {
+          // TODO: Use custom error
+          return Promise.reject(new Error('The "initialize()" function must return a Promise for async services.'));
+        }
+      })
+    );
+
+    /** We need to match the results to the input and update their metadata accordingly. */
+    initResult.forEach((result, index) => {
+      switch (result.status) {
+        case 'rejected':
+          initTasks[index].asyncInitializationStatus = 'failed';
+          initTasks[index].asyncInitializationPromise = undefined;
+          break;
+        case 'fulfilled':
+          initTasks[index].asyncInitializationStatus = 'finished';
+          initTasks[index].asyncInitializationPromise = undefined;
+          break;
+      }
+    });
+
+    const failedInitTasks = initResult.filter(r => r.status === 'rejected');
+
+    return failedInitTasks.length ? Promise.reject(failedInitTasks) : Promise.resolve([]);
+  }
+
+  public async dispose(): Promise<void> {
+    /**
+     * Placeholder.
+     * This function will dispose all service instances which are registered in this container only.
+     */
+    this.disposed = true;
+
+    await Promise.resolve();
   }
 
   /**
@@ -230,6 +349,13 @@ export class ContainerInstance {
      */
     if (serviceMetadata.value !== EMPTY_VALUE) {
       return serviceMetadata.value;
+    }
+
+    /**
+     * If the service has been marked as async but initialization hasn't been finished yet, an error is thrown.
+     */
+    if (serviceMetadata.async === true && serviceMetadata.asyncInitializationStatus !== 'finished') {
+      throw new AsyncInitializationRequiredError(serviceMetadata.type as Constructable<unknown>);
     }
 
     /** If both factory and type is missing, we cannot resolve the requested ID. */
@@ -312,7 +438,7 @@ export class ContainerInstance {
    */
   private initializeParams(target: Function, paramTypes: any[]): unknown[] {
     return paramTypes.map((paramType, index) => {
-      const paramHandler = Container.handlers.find(handler => {
+      const paramHandler = this.handlers.find(handler => {
         /**
          * @Inject()-ed values are stored as parameter handlers and they reference their target
          * when created. So when a class is extended the @Inject()-ed values are not inherited
@@ -349,7 +475,7 @@ export class ContainerInstance {
    * Applies all registered handlers on a given target class.
    */
   private applyPropertyHandlers(target: Function, instance: { [key: string]: any }) {
-    Container.handlers.forEach(handler => {
+    this.handlers.forEach(handler => {
       if (typeof handler.index === 'number') return;
       if (handler.object.constructor !== target && !(target.prototype instanceof handler.object.constructor)) return;
 
